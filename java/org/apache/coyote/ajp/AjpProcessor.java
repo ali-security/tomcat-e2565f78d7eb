@@ -1008,6 +1008,9 @@ public class AjpProcessor extends AbstractProcessor {
 
         responseFinished = true;
 
+        // Make sure the non-blocking write buffer is empty before sending the end message.
+        socketWrapper.flush(true);
+
         if (getErrorState().isError()) {
             // Write the end and close message
             socketWrapper.write(true, endAndCloseMessageArray, 0, endAndCloseMessageArray.length);
