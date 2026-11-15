@@ -27,7 +27,6 @@ import java.nio.charset.StandardCharsets;
 import jakarta.servlet.http.WebConnection;
 
 import org.apache.coyote.ProtocolException;
-import org.apache.coyote.http2.HpackDecoder.HeaderEmitter;
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
 import org.apache.tomcat.util.buf.ByteBufferUtils;
@@ -46,7 +45,7 @@ class Http2Parser {
     private final Output output;
     private final byte[] frameHeaderBuffer = new byte[9];
 
-    private volatile HpackDecoder hpackDecoder;
+    private final HpackDecoder hpackDecoder;
     private volatile ByteBuffer headerReadBuffer = ByteBuffer.allocate(Constants.DEFAULT_HEADER_READ_BUFFER_SIZE);
     private volatile int headersCurrentStream = -1;
     private volatile boolean headersEndStream = false;
@@ -55,6 +54,12 @@ class Http2Parser {
         this.connectionId = connectionId;
         this.input = input;
         this.output = output;
+        /*
+         * Obtain the HPACK decoder once, before any frames are processed, so that the parser and the container threads
+         * (e.g. stream replacement) always operate on the same HpackDecoder instance and hence the same stream emitter
+         * lock.
+         */
+        this.hpackDecoder = output.getHpackDecoder();
     }
 
 
@@ -220,11 +225,8 @@ class Http2Parser {
 
         headersEndStream = Flags.isEndOfStream(flags);
 
-        if (hpackDecoder == null) {
-            hpackDecoder = output.getHpackDecoder();
-        }
         try {
-            hpackDecoder.setHeaderEmitter(output.headersStart(streamId, headersEndStream));
+            output.headersStart(streamId, headersEndStream);
         } catch (StreamException se) {
             swallowPayload(streamId, FrameType.HEADERS.getId(), payloadSize, false, buffer);
             throw se;
@@ -272,7 +274,12 @@ class Http2Parser {
         swallowPayload(streamId, FrameType.HEADERS.getId(), padLength, true, buffer);
 
         // Validate the headers so far
-        hpackDecoder.getHeaderEmitter().validateHeaders();
+        hpackDecoder.getStreamEmitterLock().lock();
+        try {
+            hpackDecoder.getHeaderEmitter().validateHeaders();
+        } finally {
+            hpackDecoder.getStreamEmitterLock().unlock();
+        }
 
         if (Flags.isEndOfHeaders(flags)) {
             onHeadersComplete(streamId);
@@ -441,7 +448,12 @@ class Http2Parser {
         readHeaderPayload(streamId, payloadSize, buffer);
 
         // Validate the headers so far
-        hpackDecoder.getHeaderEmitter().validateHeaders();
+        hpackDecoder.getStreamEmitterLock().lock();
+        try {
+            hpackDecoder.getHeaderEmitter().validateHeaders();
+        } finally {
+            hpackDecoder.getStreamEmitterLock().unlock();
+        }
 
         if (endOfHeaders) {
             headersCurrentStream = -1;
@@ -541,14 +553,24 @@ class Http2Parser {
                 StreamException headerException = new StreamException(
                         sm.getString("http2Parser.headerLimitCount", connectionId, Integer.valueOf(streamId)),
                         Http2Error.ENHANCE_YOUR_CALM, streamId);
-                hpackDecoder.getHeaderEmitter().setHeaderException(headerException);
+                hpackDecoder.getStreamEmitterLock().lock();
+                try {
+                    hpackDecoder.getHeaderEmitter().setHeaderException(headerException);
+                } finally {
+                    hpackDecoder.getStreamEmitterLock().unlock();
+                }
             }
 
             if (hpackDecoder.isHeaderSizeExceeded(headerReadBuffer.position())) {
                 StreamException headerException = new StreamException(
                         sm.getString("http2Parser.headerLimitSize", connectionId, Integer.valueOf(streamId)),
                         Http2Error.ENHANCE_YOUR_CALM, streamId);
-                hpackDecoder.getHeaderEmitter().setHeaderException(headerException);
+                hpackDecoder.getStreamEmitterLock().lock();
+                try {
+                    hpackDecoder.getHeaderEmitter().setHeaderException(headerException);
+                } finally {
+                    hpackDecoder.getStreamEmitterLock().unlock();
+                }
             }
 
             if (hpackDecoder.isHeaderSwallowSizeExceeded(headerReadBuffer.position())) {
@@ -804,7 +826,7 @@ class Http2Parser {
                 throws ConnectionException, IOException;
 
         // Header frames
-        HeaderEmitter headersStart(int streamId, boolean headersEndStream) throws Http2Exception, IOException;
+        void headersStart(int streamId, boolean headersEndStream) throws Http2Exception, IOException;
 
         void headersContinue(int payloadSize, boolean endOfHeaders);
 
