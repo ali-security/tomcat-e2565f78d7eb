@@ -1905,6 +1905,60 @@ public class TestAsyncContextImpl extends TomcatBaseTest {
         }
     }
 
+
+    /*
+     * An error on the container thread after startAsync() but before Servlet.service() exits places the async state
+     * machine in the MUST_ERROR state. If no AsyncListener calls complete() or dispatch() from onError(), the container
+     * must complete the request with an error response. It must not trigger an IllegalStateException when
+     * Servlet.service() exits as that skips the normal clean-up of the request and response.
+     */
+    @Test
+    public void testErrorBeforeServiceExitNoListenerAction() throws Exception {
+        resetTracker();
+        Tomcat tomcat = getTomcatInstance();
+
+        Context ctx = getProgrammaticRootContext();
+        ErrorBeforeServiceExitServlet servlet = new ErrorBeforeServiceExitServlet();
+        Wrapper w = tomcat.addServlet("", "async", servlet);
+        w.setAsyncSupported(true);
+        ctx.addServletMappingDecoded("/async", "async");
+
+        tomcat.start();
+
+        ByteChunk res = new ByteChunk();
+        int rc = getUrl("http://localhost:" + getPort() + "/async", res, null);
+
+        Assert.assertEquals(HttpServletResponse.SC_INTERNAL_SERVER_ERROR, rc);
+
+        // Request may complete before listener has finished processing so wait up to 5s for the right response
+        String expectedTrack = "doGet-onError-onComplete-";
+        int count = 0;
+        while (!expectedTrack.equals(getTrack()) && count < 100) {
+            Thread.sleep(50);
+            count++;
+        }
+        Assert.assertEquals(expectedTrack, getTrack());
+    }
+
+
+    private static class ErrorBeforeServiceExitServlet extends HttpServlet {
+
+        private static final long serialVersionUID = 1L;
+
+        // Neither completes nor dispatches on error
+        private final transient TrackingListener trackingListener = new TrackingListener(false, false, null);
+
+        @Override
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
+            track("doGet-");
+            AsyncContext ctx = req.startAsync();
+            ctx.setTimeout(3000);
+            ctx.addListener(trackingListener);
+            throw new ServletException();
+        }
+    }
+
+
     @Test
     public void testForbiddenDispatching() throws Exception {
         resetTracker();

@@ -532,6 +532,68 @@ public class TestStreamProcessor extends Http2TestBase {
     }
 
 
+    /*
+     * An error on the container thread after startAsync() but before Servlet.service() exits places the async state
+     * machine in the MUST_ERROR state. If that state is not treated as an async error, the async request is not
+     * completed and an IllegalStateException is triggered when Servlet.service() exits. That fails the connection and
+     * returns the request and response for the stream to the pool without the associated Servlet request and response
+     * having been recycled, exposing the data from that request to the next stream that re-uses them.
+     */
+    @Test
+    public void testAsyncErrorBeforeServiceExitClearedOnRecycle() throws Exception {
+        enableHttp2();
+
+        Tomcat tomcat = getTomcatInstance();
+
+        Context ctxt = getProgrammaticRootContext();
+        Tomcat.addServlet(ctxt, "simple", new SimpleServlet());
+        ctxt.addServletMappingDecoded("/simple", "simple");
+        Wrapper w = Tomcat.addServlet(ctxt, "asyncError", new AsyncErrorBeforeServiceExit());
+        w.setAsyncSupported(true);
+        ctxt.addServletMappingDecoded("/asyncError", "asyncError");
+        Tomcat.addServlet(ctxt, "attribute", new RequestAttributeServlet());
+        ctxt.addServletMappingDecoded("/attribute", "attribute");
+
+        tomcat.start();
+
+        openClientConnection();
+        doHttpUpgrade();
+        sendClientPreface();
+        validateHttp2InitialResponse();
+
+        byte[] frameHeader = new byte[9];
+        ByteBuffer headersPayload = ByteBuffer.allocate(128);
+        buildGetRequest(frameHeader, headersPayload, null, 3, "/asyncError");
+        writeFrame(frameHeader, headersPayload);
+
+        while (!output.getTrace().contains("3-EndOfStream") && !output.getTrace().contains("0-Goaway")) {
+            parser.readFrame();
+        }
+        // The container must complete the async request with an error response without failing the connection
+        String trace = output.getTrace();
+        Assert.assertFalse(trace, trace.contains("0-Goaway"));
+        Assert.assertTrue(trace, trace.contains("3-Header-[:status]-[500]"));
+        output.clearTrace();
+
+        // Requests for streams 1 and 3 need to be returned to the pool before the request for stream 5 is received
+        waitForRecycledRequests(2);
+
+        // The request for stream 5 re-uses the request from stream 3 and must not see any data from stream 3
+        output.setTraceBody(true);
+        headersPayload.clear();
+        buildGetRequest(frameHeader, headersPayload, null, 5, "/attribute");
+        writeFrame(frameHeader, headersPayload);
+
+        while (!output.getTrace().contains("5-EndOfStream") && !output.getTrace().contains("0-Goaway")) {
+            parser.readFrame();
+        }
+        trace = output.getTrace();
+        Assert.assertTrue(trace, trace.contains("5-Header-[:status]-[200]"));
+        Assert.assertTrue(trace, trace.contains("5-Body-null\n"));
+        Assert.assertFalse(trace, trace.contains(AsyncErrorBeforeServiceExit.ATTRIBUTE_VALUE));
+    }
+
+
     private void waitForRecycledRequests(int count) throws InterruptedException {
         /*
          * The request statistics are updated by StreamProcessor.recycle() immediately before the request is returned to
@@ -602,6 +664,40 @@ public class TestStreamProcessor extends Http2TestBase {
                     }
                 }
             });
+        }
+    }
+
+
+    private static final class AsyncErrorBeforeServiceExit extends HttpServlet {
+
+        private static final long serialVersionUID = 1L;
+
+        static final String ATTRIBUTE_NAME = "org.apache.coyote.http2.TestStreamProcessor.attribute";
+        static final String ATTRIBUTE_VALUE = "AsyncErrorBeforeServiceExit-private-data";
+
+        @Override
+        protected void doGet(HttpServletRequest request, HttpServletResponse response)
+                throws ServletException, IOException {
+
+            request.setAttribute(ATTRIBUTE_NAME, ATTRIBUTE_VALUE);
+            request.startAsync(request, response);
+            // Error before service() exits. No AsyncListener calls complete() or dispatch().
+            throw new ServletException();
+        }
+    }
+
+
+    private static final class RequestAttributeServlet extends HttpServlet {
+
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        protected void doGet(HttpServletRequest request, HttpServletResponse response)
+                throws ServletException, IOException {
+
+            response.setContentType("text/plain");
+            response.setCharacterEncoding("UTF-8");
+            response.getWriter().print(request.getAttribute(AsyncErrorBeforeServiceExit.ATTRIBUTE_NAME));
         }
     }
 
